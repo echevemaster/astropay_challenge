@@ -1,0 +1,262 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: astropay
+      POSTGRES_PASSWORD: astropay
+      POSTGRES_DB: activity_feed
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U astropay"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9093:9093"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_INTERNAL://kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_INTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT_INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Servicio para ejecutar migraciones
+  migrations:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: alembic upgrade head
+    environment:
+      DATABASE_URL: postgresql://astropay:astropay@postgres:5432/activity_feed
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    profiles:
+      - migrate
+
+  # Application service
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      USE_ELASTICSEARCH_AS_PRIMARY: "true" 
+      DATABASE_URL: postgresql://astropay:astropay@postgres:5432/activity_feed
+      REDIS_URL: redis://redis:6379/0
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+      KAFKA_TRANSACTIONS_TOPIC: transactions
+      KAFKA_CONSUMER_GROUP: transaction_indexer
+      CIRCUIT_BREAKER_ENABLED: "false"
+      DEBUG: "True"
+      LOG_LEVEL: INFO
+      API_PREFIX: /api/v1
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # Servicio para limpiar datos
+  clean_data:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python3 clean_data.py
+    environment:
+      DATABASE_URL: postgresql://astropay:astropay@postgres:5432/activity_feed
+      REDIS_URL: redis://redis:6379/0
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      DOCKER_CONTAINER: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    profiles:
+      - clean
+
+  # Servicio para cargar datos de prueba
+  load_test_data:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python3 generate_test_data.py
+    environment:
+      DATABASE_URL: postgresql://astropay:astropay@postgres:5432/activity_feed
+      API_URL: http://api:8000/api/v1
+      DOCKER_CONTAINER: "true"
+    depends_on:
+      api:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    profiles:
+      - test-data
+
+  # Servicio para ejecutar tests
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: pytest tests/ -v --cov=app --cov-report=term-missing
+    environment:
+      DATABASE_URL: "sqlite:///:memory:"
+      REDIS_URL: "redis://redis:6379/0"
+      ELASTICSEARCH_URL: "http://elasticsearch:9200"
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+      KAFKA_TRANSACTIONS_TOPIC: transactions
+      SECRET_KEY: "test-secret-key-for-testing-only"
+      JWT_ALGORITHM: "HS256"
+      JWT_EXPIRE_MINUTES: "30"
+      DEBUG: "True"
+      LOG_LEVEL: "INFO"
+      RATE_LIMIT_ENABLED: "false"
+    volumes:
+      - .:/app
+    profiles:
+      - tests
+
+  # Servicio para consumir mensajes de Kafka
+  consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python3 consumer_worker.py
+    environment:
+      DATABASE_URL: postgresql://astropay:astropay@postgres:5432/activity_feed
+      REDIS_URL: redis://redis:6379/0
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+      KAFKA_TRANSACTIONS_TOPIC: transactions
+      KAFKA_CONSUMER_GROUP: transaction_indexer
+      KAFKA_AUTO_OFFSET_RESET: earliest
+      KAFKA_ENABLE_AUTO_COMMIT: "false"
+      CIRCUIT_BREAKER_ENABLED: "false"
+      CONSUMER_BATCH_SIZE: "1"
+      CONSUMER_BATCH_TIMEOUT: "2.0"
+      CONSUMER_ENABLE_AUDIT_DB: "true"
+      DEBUG: "True"
+      LOG_LEVEL: INFO
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    restart: unless-stopped
+
+  # Service to publish synthetic data to Kafka
+  publish_test_data:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # El comando puede ser sobrescrito al ejecutar, o usar variables de entorno
+    command: >
+      sh -c "python3 publish_test_data_to_kafka.py 
+      --count $${PUBLISH_COUNT:-1000} 
+      --user-id $${PUBLISH_USER_ID:-test_user_123}
+      --update-ratio $${PUBLISH_UPDATE_RATIO:-0.1}"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9093
+      KAFKA_TRANSACTIONS_TOPIC: transactions
+      DOCKER_CONTAINER: "true"
+      PUBLISH_COUNT: "1000"
+      PUBLISH_USER_ID: "test_user_123"
+      PUBLISH_UPDATE_RATIO: "0.1"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    profiles:
+      - publish-data
+
+volumes:
+  postgres_data:
+  es_data:
+

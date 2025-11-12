@@ -1,0 +1,16 @@
+Senior Backend Engineer - Challenge Document
+Context Overview
+AstroPay is building the world’s first truly global wallet, enabling digital nomads and global users to conduct a wide array of financial transactions, including withdrawals, peer-to-peer transfers, wallet top-ups, cryptocurrency operations, bill payments, debit card usage, and more. Each transaction type could be processed by different microservices within our ecosystem.
+The Challenge
+Our users interact with a growing number of products (Card, P2P, Earnings, Crypto), but their transaction history is often fragmented. This creates a confusing experience as transactions originate from diverse source microservices across our platform. 
+Design a scalable, real-time system to consolidate all financial transactions into a single, unified "Activity Feed." This feed must be instantly searchable, filterable by standard dimensions (product, currency, status, etc.), and efficiently paginated. Crucially, different transaction types may have unique, custom metadata (e.g., the merchant details for a card payment, or the peer's information for a P2P transfer). Your search solution must be able to query these custom fields efficiently. 
+Your design should detail the architecture for gathering this data, the storage strategy for fast reads, and the API contract for the frontend clients While app internal architecture is beyond the scope of the current challenge, you are expected to create API contracts that support an excellent UX for the user As a reference, here are some examples of what the UX should be to the end user:
+Transaction list: filter by freeform content
+
+Transaction list: filter by date
+
+Transaction detail: card payment
+
+Transaction list: P2P transfer sent
+
+Beyond the explicit requirements, feel free to highlight any additional considerations, potential challenges, or innovative solutions you believe are critical for a robust and production-ready system.

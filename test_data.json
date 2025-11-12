@@ -1,0 +1,17 @@
+[
+  {
+    "user_id": "test_user_123",
+    "transaction_type": "card",
+    "product": "Card",
+    "status": "completed",
+    "currency": "USD",
+    "amount": 45.50,
+    "metadata": {
+      "merchant_name": "Starbucks",
+      "merchant_category": "Food & Beverage",
+      "card_last_four": "1234",
+      "location": "San Francisco, CA"
+    }
+  }
+]
+
