@@ -80,6 +80,392 @@ Unified Activity Feed API to consolidate all financial transactions from multipl
 - Elasticsearch indexing does not block the response
 - Events published asynchronously
 
+## 📊 Diagramas de Flujo C4
+
+### Nivel 1: Contexto del Sistema
+
+```mermaid
+graph TB
+    subgraph "Contexto del Sistema"
+        User[👤 Usuario<br/>Cliente que consume la API]
+        API[🌐 Activity Feed API<br/>API unificada para transacciones financieras]
+        Microservices[🔌 Microservicios<br/>Servicios que generan transacciones]
+    end
+    
+    User -->|Consulta y crea transacciones<br/>HTTPS/REST| API
+    Microservices -->|Publica eventos de transacciones<br/>Kafka| API
+    
+    style User fill:#e1f5ff
+    style API fill:#fff4e1
+    style Microservices fill:#ffe1f5
+```
+
+### Nivel 2: Contenedores
+
+```mermaid
+graph TB
+    subgraph "Sistema de Activity Feed"
+        API[🚀 FastAPI Application<br/>Python/FastAPI<br/>API REST con validación automática]
+        Consumer[📨 Kafka Consumer<br/>Python<br/>Consumidor de mensajes para indexación]
+    end
+    
+    User[👤 Usuario]
+    Postgres[(🗄️ PostgreSQL<br/>Base de datos principal con JSONB)]
+    Redis[(💾 Redis<br/>Cache en memoria)]
+    Elasticsearch[(🔍 Elasticsearch<br/>Motor de búsqueda full-text)]
+    Kafka[📬 Kafka<br/>Sistema de mensajería para eventos]
+    
+    User -->|HTTPS REST API| API
+    API -->|Lee y escribe<br/>SQLAlchemy| Postgres
+    API -->|Lee y escribe<br/>Redis Client| Redis
+    API -->|Indexa y busca<br/>Elasticsearch Client| Elasticsearch
+    API -->|Publica eventos<br/>Kafka Producer| Kafka
+    Consumer -->|Consume mensajes<br/>Kafka Consumer| Kafka
+    Consumer -->|Indexa transacciones<br/>Elasticsearch Client| Elasticsearch
+    Consumer -->|Escribe auditoría<br/>SQLAlchemy| Postgres
+    Consumer -->|Verifica idempotencia<br/>Redis Client| Redis
+    
+    style API fill:#fff4e1
+    style Consumer fill:#fff4e1
+    style Postgres fill:#e1ffe1
+    style Redis fill:#ffe1e1
+    style Elasticsearch fill:#e1e1ff
+    style Kafka fill:#ffe1f5
+```
+
+### Flujo 1: Crear Transacción
+
+```mermaid
+sequenceDiagram
+    participant U as Usuario
+    participant API as FastAPI Router
+    participant Auth as Auth Middleware
+    participant TS as Transaction Service
+    participant Strategy as Transaction Strategy
+    participant Repo as Transaction Repository
+    participant DB as PostgreSQL
+    participant Cache as Cache Service
+    participant Search as Search Service
+    participant ES as Elasticsearch
+    participant Event as Event Service
+    participant Kafka as Kafka
+    
+    U->>API: POST /api/v1/transactions
+    API->>Auth: Validar JWT (opcional)
+    Auth-->>API: user_id
+    
+    API->>TS: create_transaction(data)
+    
+    TS->>Strategy: get_strategy(transaction_type)
+    Strategy-->>TS: Strategy instance
+    
+    TS->>Strategy: validate_metadata(metadata)
+    Strategy-->>TS: validation result
+    
+    TS->>Strategy: enrich_metadata(metadata)
+    Strategy-->>TS: enriched metadata
+    
+    TS->>Strategy: build_search_content(data)
+    Strategy-->>TS: search_content
+    
+    TS->>Repo: create(transaction_data)
+    Repo->>DB: INSERT transaction
+    DB-->>Repo: transaction created
+    Repo-->>TS: Transaction object
+    
+    par Indexación asíncrona
+        TS->>Search: index_transaction(transaction)
+        Search->>ES: Index document
+        ES-->>Search: Success
+    and Publicación de evento
+        TS->>Event: publish_transaction_created(transaction)
+        Event->>Kafka: Publish event
+        Kafka-->>Event: Success
+    and Invalidación de cache
+        TS->>Cache: delete_pattern(user:*)
+        Cache-->>TS: Cache invalidated
+    end
+    
+    TS-->>API: TransactionResponse
+    API-->>U: 201 Created
+```
+
+### Flujo 2: Buscar/Listar Transacciones
+
+```mermaid
+sequenceDiagram
+    participant U as Usuario
+    participant API as FastAPI Router
+    participant Auth as Auth Middleware
+    participant TS as Transaction Service
+    participant Cache as Cache Service
+    participant Redis as Redis
+    participant Search as Search Service
+    participant ES as Elasticsearch
+    participant Repo as Transaction Repository
+    participant DB as PostgreSQL
+    
+    U->>API: GET /api/v1/transactions?filters
+    API->>Auth: Validar JWT (opcional)
+    Auth-->>API: user_id
+    
+    API->>TS: get_transactions(user_id, filters, pagination)
+    
+    TS->>Cache: get(cache_key)
+    Cache->>Redis: GET key
+    Redis-->>Cache: cached result (o null)
+    
+    alt Cache Hit
+        Cache-->>TS: Cached data
+        TS-->>API: PaginatedResponse
+        API-->>U: 200 OK (from cache)
+    else Cache Miss
+        alt Tiene search_query
+            TS->>Search: search(user_id, query, filters)
+            Search->>ES: Execute search query
+            ES-->>Search: transaction_ids, total
+            Search-->>TS: IDs y total
+            
+            loop Para cada ID
+                TS->>Repo: get_by_id(tx_id)
+                Repo->>DB: SELECT by id
+                DB-->>Repo: Transaction
+                Repo-->>TS: Transaction object
+            end
+        else Sin search_query
+            TS->>Repo: get_by_user_id(user_id, filters, pagination)
+            Repo->>DB: SELECT with filters
+            DB-->>Repo: transactions, total
+            Repo-->>TS: Transactions list
+        end
+        
+        TS->>TS: Build PaginatedResponse
+        TS->>Cache: set(cache_key, result)
+        Cache->>Redis: SETEX key TTL value
+        Redis-->>Cache: Success
+        
+        TS-->>API: PaginatedResponse
+        API-->>U: 200 OK
+    end
+```
+
+### Flujo 3: Obtener Transacción por ID
+
+```mermaid
+sequenceDiagram
+    participant U as Usuario
+    participant API as FastAPI Router
+    participant Auth as Auth Middleware
+    participant TS as Transaction Service
+    participant Cache as Cache Service
+    participant Redis as Redis
+    participant Repo as Transaction Repository
+    participant DB as PostgreSQL
+    
+    U->>API: GET /api/v1/transactions/{id}
+    API->>Auth: Validar JWT (opcional)
+    Auth-->>API: user_id
+    
+    API->>TS: get_transaction(transaction_id)
+    
+    TS->>Cache: get(cache_key)
+    Cache->>Redis: GET transaction:{id}
+    Redis-->>Cache: cached result (o null)
+    
+    alt Cache Hit
+        Cache-->>TS: Cached TransactionResponse
+        TS->>TS: Validar ownership (si autenticado)
+        TS-->>API: TransactionResponse
+        API-->>U: 200 OK
+    else Cache Miss
+        TS->>Repo: get_by_id(transaction_id)
+        Repo->>DB: SELECT by id
+        DB-->>Repo: Transaction (o null)
+        Repo-->>TS: Transaction object
+        
+        alt Transaction not found
+            TS-->>API: None
+            API-->>U: 404 Not Found
+        else Transaction found
+            TS->>TS: Validar ownership (si autenticado)
+            TS->>TS: Build TransactionResponse
+            TS->>Cache: set(cache_key, response)
+            Cache->>Redis: SETEX key TTL value
+            Redis-->>Cache: Success
+            
+            TS-->>API: TransactionResponse
+            API-->>U: 200 OK
+        end
+    end
+```
+
+### Flujo 4: Health Check
+
+```mermaid
+sequenceDiagram
+    participant U as Usuario/Monitor
+    participant API as FastAPI Router
+    participant Health as Health Endpoint
+    participant DB as PostgreSQL
+    participant Cache as Cache Service
+    participant Redis as Redis
+    participant Search as Search Service
+    participant ES as Elasticsearch
+    participant Event as Event Service
+    participant Kafka as Kafka
+    participant CB as Circuit Breakers
+    
+    U->>API: GET /api/v1/health
+    API->>Health: health_check()
+    
+    par Verificar Base de Datos
+        Health->>DB: SELECT 1
+        DB-->>Health: Success/Failure
+    and Verificar Cache
+        Health->>Cache: health_check()
+        Cache->>Redis: PING
+        Redis-->>Cache: PONG
+        Cache->>CB: get_redis_breaker().get_state()
+        CB-->>Cache: breaker state
+        Cache-->>Health: Status + breaker state
+    and Verificar Search
+        Health->>Search: health_check()
+        Search->>ES: PING
+        ES-->>Search: PONG
+        Search->>CB: get_elasticsearch_breaker().get_state()
+        CB-->>Search: breaker state
+        Search-->>Health: Status + breaker state
+    and Verificar Events
+        Health->>Event: health_check()
+        Event->>Kafka: list_topics()
+        Kafka-->>Event: Metadata
+        Event->>CB: get_kafka_breaker().get_state()
+        CB-->>Event: breaker state
+        Event-->>Health: Status + breaker state
+    end
+    
+    Health->>Health: Calcular overall_status
+    Note over Health: healthy: todos OK<br/>degraded: algunos degradados<br/>unhealthy: DB falló
+    
+    Health-->>API: HealthCheckResponse
+    API-->>U: 200 OK con status detallado
+```
+
+### Flujo 5: Consumidor de Mensajes Kafka
+
+```mermaid
+sequenceDiagram
+    participant Kafka as Kafka Topic
+    participant Consumer as Message Consumer
+    participant Cache as Cache Service
+    participant Redis as Redis
+    participant Search as Search Service
+    participant ES as Elasticsearch
+    participant Repo as Transaction Repository
+    participant DB as PostgreSQL
+    participant DLQ as Dead Letter Queue
+    
+    loop Consumo continuo
+        Kafka->>Consumer: Poll messages (batch)
+        
+        Consumer->>Consumer: Agrupar mensajes por batch
+        
+        loop Para cada mensaje en batch
+            Consumer->>Consumer: Extraer transaction_id
+            
+            Consumer->>Cache: Verificar idempotencia
+            Cache->>Redis: GET processed:{transaction_id}
+            Redis-->>Cache: processed flag (o null)
+            
+            alt Ya procesado (idempotencia)
+                Cache-->>Consumer: Ya procesado
+                Note over Consumer: Skip message
+            else No procesado
+                Consumer->>Consumer: Deserializar mensaje
+                Consumer->>Consumer: Validar estructura
+                
+                alt Mensaje inválido
+                    Consumer->>DLQ: Enviar a DLQ
+                    Note over Consumer: Log error
+                else Mensaje válido
+                    par Indexar en Elasticsearch
+                        Consumer->>Search: index_transaction(transaction)
+                        Search->>ES: Index document (con versioning)
+                        ES-->>Search: Success/Failure
+                        Search-->>Consumer: Result
+                    and Guardar en DB (auditoría)
+                        Consumer->>Repo: create(transaction)
+                        Repo->>DB: INSERT transaction
+                        DB-->>Repo: Success
+                        Repo-->>Consumer: Transaction
+                    end
+                    
+                    alt Procesamiento exitoso
+                        Consumer->>Cache: Marcar como procesado
+                        Cache->>Redis: SETEX processed:{id} TTL
+                        Redis-->>Cache: Success
+                        Consumer->>Consumer: Commit offset
+                    else Error en procesamiento
+                        Consumer->>DLQ: Enviar a DLQ
+                        Consumer->>Consumer: Log error
+                        Note over Consumer: No commit offset<br/>(reintento automático)
+                    end
+                end
+            end
+        end
+        
+        Consumer->>Kafka: Commit batch offset
+    end
+```
+
+### Flujo 6: Diagrama de Componentes (Transaction Service)
+
+```mermaid
+graph TB
+    subgraph "FastAPI Application"
+        Router[📡 Transaction Router<br/>FastAPI Router<br/>Maneja endpoints REST]
+        Auth[🔐 Auth Middleware<br/>JWT Validator<br/>Autenticación y autorización]
+    end
+    
+    subgraph "Service Layer"
+        TS[⚙️ Transaction Service<br/>Business Logic<br/>Orquesta operaciones]
+        CacheSvc[💾 Cache Service<br/>Redis Client<br/>Gestión de cache]
+        SearchSvc[🔍 Search Service<br/>Elasticsearch Client<br/>Búsqueda full-text]
+        EventSvc[📨 Event Service<br/>Kafka Producer<br/>Publicación de eventos]
+    end
+    
+    subgraph "Data Layer"
+        Repo[🗄️ Transaction Repository<br/>Data Access<br/>Abstracción de acceso a datos]
+        Strategy[🎯 Transaction Strategy<br/>Strategy Pattern<br/>Procesamiento por tipo]
+    end
+    
+    Postgres[(🗄️ PostgreSQL)]
+    Redis[(💾 Redis)]
+    Elasticsearch[(🔍 Elasticsearch)]
+    Kafka[📬 Kafka]
+    
+    Router -->|Valida JWT| Auth
+    Router -->|Llama métodos| TS
+    TS -->|Usa cache| CacheSvc
+    TS -->|Indexa y busca| SearchSvc
+    TS -->|Publica eventos| EventSvc
+    TS -->|Accede a datos| Repo
+    TS -->|Procesa por tipo| Strategy
+    Repo -->|SQL queries| Postgres
+    CacheSvc -->|Cache ops| Redis
+    SearchSvc -->|Search ops| Elasticsearch
+    EventSvc -->|Publish events| Kafka
+    
+    style Router fill:#fff4e1
+    style Auth fill:#fff4e1
+    style TS fill:#e1f5ff
+    style CacheSvc fill:#e1f5ff
+    style SearchSvc fill:#e1f5ff
+    style EventSvc fill:#e1f5ff
+    style Repo fill:#ffe1f5
+    style Strategy fill:#ffe1f5
+```
+
 ## 🚀 Quick Start
 
 ### Prerequisites
